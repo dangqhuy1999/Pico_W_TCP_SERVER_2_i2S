@@ -22,6 +22,6 @@ In addition to original connection
 
 -------------------------
 -------------------------
-export PICO_SDK_PATH=/home/huydang/Desktop/c_c++/pico-sdk
-export PICO_EXTRAS_PATH=/home/huydang/Desktop/c_c++/pico-extras
+export PICO_SDK_PATH=/home/huydang/Documents/enviTestNewTech/IOT/rasberry_pi_pico_x/pico/pico-sdk
+export PICO_EXTRAS_PATH=/home/huydang/Documents/enviTestNewTech/IOT/rasberry_pi_pico_x/pico/pico-extras
 
