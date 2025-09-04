@@ -17,24 +17,26 @@ add_subdirectory(../.. pico_audio_i2s_32b)
 
 set(bin_name ${PROJECT_NAME})
 add_executable(${PROJECT_NAME}
-    sine_wave.cpp
+    main.cpp
+)
+
+target_include_directories(${bin_name} PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}
+    ${CMAKE_CURRENT_LIST_DIR}/.. # for our common lwipopts
 )
 
 pico_enable_stdio_usb(${bin_name} 1)
 pico_enable_stdio_uart(${bin_name} 1)
 
 target_link_libraries(${bin_name} PRIVATE
+    pico_cyw43_arch_lwip_threadsafe_background
     pico_stdlib
     pico_audio_32b
     pico_audio_i2s_32b
 )
 
-# set PIO and DMA for I2S
-# set core1 process i2s_callback
-#target_compile_definitions(${PROJECT_NAME} PRIVATE
-#    PICO_AUDIO_I2S_PIO=1
-#    PICO_AUDIO_I2S_DMA_IRQ=1
-#    CORE1_PROCESS_I2S_CALLBACK
-#)
+target_compile_definitions(${PROJECT_NAME} PRIVATE
+    PICO_AUDIO_I2S_DMA_CHANNEL=4
+)
 
 pico_add_extra_outputs(${bin_name})

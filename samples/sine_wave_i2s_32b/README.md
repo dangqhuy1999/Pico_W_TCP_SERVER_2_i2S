@@ -19,3 +19,9 @@ In addition to original connection
 * type ']' to increase left channel's frequency
 * type '{' to decrease right channel's frequency
 * type '}' to increase right channel's frequency
+
+-------------------------
+-------------------------
+export PICO_SDK_PATH=/home/huydang/Desktop/c_c++/pico-sdk
+export PICO_EXTRAS_PATH=/home/huydang/Desktop/c_c++/pico-extras
+
