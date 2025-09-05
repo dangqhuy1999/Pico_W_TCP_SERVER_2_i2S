@@ -20,11 +20,14 @@
 #include "project_config.h"
 #include "pico/audio.h"
 #include "pico/audio_i2s.h"
+#include "ringbuf.h"
 
 #define SINE_WAVE_TABLE_LEN 2048
 #define SAMPLES_PER_BUFFER 1024  // frames / channel
 #define BUFFER_COUNT       12    // số buffer trong pool
-#define USE_RING_BUFFER 1   // 0 = không dùng ring buffer, 1 = dùng ring buffer
+#define USE_RING_BUFFER 0   // 0 = không dùng ring buffer, 1 = dùng ring buffer
+#define audio_pio __CONCAT(pio, PICO_AUDIO_I2S_PIO)
+
 
 static const uint32_t PIN_DCDC_PSM_CTRL = 23;
 
@@ -32,8 +35,6 @@ audio_buffer_pool_t *ap;
 
 static bool decode_flg = false;
 static constexpr int32_t DAC_ZERO = 1;
-
-#define audio_pio __CONCAT(pio, PICO_AUDIO_I2S_PIO)
 
 static audio_format_t audio_format = {
     .sample_freq = 16000,
@@ -62,6 +63,10 @@ uint32_t pos1 = 0;
 const uint32_t pos_max = 0x10000 * SINE_WAVE_TABLE_LEN;
 uint vol = 20;
 
+
+#if USE_RING_BUFFER
+static ringbuf_t audio_ringbuf;
+#endif
 
 #if 0
 audio_buffer_pool_t *init_audio() {
@@ -129,39 +134,6 @@ audio_buffer_pool_t *init_audio() {
 }
 #endif
 
-
-// ====== cấu hình ring buffer ======
-#if USE_RING_BUFFER
-#define RING_BUFFER_SIZE 8192  // byte, tuỳ RAM
-static uint8_t ring_buffer[RING_BUFFER_SIZE];
-static volatile uint16_t rb_head = 0, rb_tail = 0;
-
-static inline uint16_t rb_available(void) {
-    return (rb_head >= rb_tail) ? (rb_head - rb_tail)
-                                : (RING_BUFFER_SIZE - (rb_tail - rb_head));
-}
-
-static inline uint16_t rb_space(void) {
-    return RING_BUFFER_SIZE - rb_available() - 1;
-}
-
-static void rb_write(const uint8_t *data, uint16_t len) {
-    for (uint16_t i = 0; i < len; i++) {
-        ring_buffer[rb_head] = data[i];
-        rb_head = (rb_head + 1) % RING_BUFFER_SIZE;
-    }
-}
-
-static uint16_t rb_read(uint8_t *dst, uint16_t len) {
-    uint16_t cnt = 0;
-    while (cnt < len && rb_tail != rb_head) {
-        dst[cnt++] = ring_buffer[rb_tail];
-        rb_tail = (rb_tail + 1) % RING_BUFFER_SIZE;
-    }
-    return cnt;
-}
-#endif
-
 typedef struct TCP_SERVER_T_ {
     struct tcp_pcb *server_pcb;
     struct tcp_pcb *client_pcb;
@@ -173,13 +145,16 @@ typedef struct TCP_SERVER_T_ {
     int run_count;
 } TCP_SERVER_T;
 
+/*
 audio_buffer_pool_t *i2s_audio_init(uint32_t sample_freq)
 {
     audio_format.sample_freq = sample_freq;
 
-    audio_buffer_pool_t *producer_pool = audio_new_producer_pool(&producer_format,
-                                                                 BUFFER_COUNT,
-                                                                 SAMPLES_PER_BUFFER);
+    audio_buffer_pool_t *producer_pool = audio_new_producer_pool(&producer_format, BUFFER_COUNT, SAMPLES_PER_BUFFER);
+    if (!producer_pool) {
+        printf("Failed to allocate audio producer pool!\n");
+        return NULL;
+    }
     ap = producer_pool;
 
     const audio_format_t *output_format = audio_i2s_setup(&audio_format, &audio_format, &i2s_config);
@@ -192,6 +167,11 @@ audio_buffer_pool_t *i2s_audio_init(uint32_t sample_freq)
 
     // initial buffer = silence
     audio_buffer_t *ab = take_audio_buffer(producer_pool, true);
+    if (!ab) {
+        printf("Failed to take initial audio buffer!\n");
+        return NULL;
+    }
+
     int16_t *samples = (int16_t *) ab->buffer->bytes;
     for (uint i = 0; i < ab->max_sample_count; i++) {
         samples[i*2+0] = DAC_ZERO;
@@ -202,6 +182,73 @@ audio_buffer_pool_t *i2s_audio_init(uint32_t sample_freq)
 
     audio_i2s_set_enabled(true);
     decode_flg = true;
+
+    return producer_pool;
+}
+*/
+
+// ⚠️ Các biến debug-safe, chỉ để quan sát bằng GDB
+volatile uint32_t dbg_sample_freq = 0;
+volatile uintptr_t dbg_producer_pool = 0;
+volatile bool dbg_i2s_enabled = false;
+
+audio_buffer_pool_t *i2s_audio_init_debug(uint32_t sample_freq) {
+
+#if 0  // USE_RING_BUFFER
+    if (multicore_core1_is_running()) {
+        multicore_reset_core1();  // halt core1 để tránh ghi đè RAM
+    }
+#endif
+
+    // 1️⃣ Cập nhật sample rate
+    audio_format.sample_freq = sample_freq;
+    dbg_sample_freq = sample_freq;  // Ghi lại để debug
+
+    // 2️⃣ Tạo producer pool
+    audio_buffer_pool_t *producer_pool = audio_new_producer_pool(
+        &producer_format,
+        BUFFER_COUNT,
+        SAMPLES_PER_BUFFER
+    );
+    if (!producer_pool) {
+        dbg_producer_pool = 0;
+        return NULL;
+    }
+    ap = producer_pool;
+    dbg_producer_pool = (uintptr_t)producer_pool; // GDB có thể xem địa chỉ pool
+
+    // 3️⃣ Setup I2S
+    const audio_format_t *output_format = audio_i2s_setup(&audio_format, &audio_format, &i2s_config);
+    if (!output_format) {
+        dbg_i2s_enabled = false;
+        return NULL;
+    }
+
+    // 4️⃣ Connect pool
+    if (!audio_i2s_connect(producer_pool)) {
+        dbg_i2s_enabled = false;
+        return NULL;
+    }
+
+    // 5️⃣ Init first buffer = silence
+    audio_buffer_t *ab = take_audio_buffer(producer_pool, true);
+    if (!ab || !ab->buffer || !ab->buffer->bytes) {
+        dbg_i2s_enabled = false;
+        return NULL;
+    }
+
+    int16_t *samples = (int16_t *) ab->buffer->bytes;
+    for (uint i = 0; i < ab->max_sample_count; i++) {
+        samples[i*2+0] = DAC_ZERO;
+        samples[i*2+1] = DAC_ZERO;
+    }
+    ab->sample_count = ab->max_sample_count;
+    give_audio_buffer(producer_pool, ab);
+
+    // 6️⃣ Enable I2S & set decode flag
+    audio_i2s_set_enabled(true);
+    decode_flg = true;
+    dbg_i2s_enabled = true;
 
     return producer_pool;
 }
@@ -305,38 +352,66 @@ static err_t tcp_server_close(void *arg) {
 
 err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err) {
     if (!p) {
-        printf("Client closed the connection.\n");
+        printf("[INFO] Client closed the connection.\n");
         return ERR_OK;
     }
 
     if (err != ERR_OK) {
+        printf("[WARN] TCP error %d, freeing pbuf\n", err);
         pbuf_free(p);
         return err;
     }
 
+    if (!p->payload) {
+        printf("[ERROR] pbuf payload is NULL, tot_len=%u\n", p->tot_len);
+        pbuf_free(p);
+        return ERR_OK;
+    }
+
 #if USE_RING_BUFFER
-    // --- Phiên bản có ring buffer ---
-    // Ghi toàn bộ dữ liệu pbuf vào ring buffer
-    rb_write(&audio_ringbuf, (uint8_t *)p->payload, p->tot_len);
+    uint16_t remaining = p->tot_len;
+    uint16_t offset = 0;
 
-    tcp_recved(tpcb, p->tot_len);  // báo đã nhận hết
-    // consumer loop (task riêng) sẽ đọc ring buffer -> copy sang audio_buffer_pool
+    while (remaining > 0) {
+        uint16_t space = rb_space(&audio_ringbuf);
+        uint16_t to_write = (remaining > space) ? space : remaining;
 
+        if (to_write == 0) {
+            printf("[WARN] Ring buffer full, dropping %u bytes\n", remaining);
+            break;
+        }
+
+        rb_write(&audio_ringbuf, (uint8_t *)p->payload + offset, to_write);
+        tcp_recved(tpcb, to_write);
+
+        offset    += to_write;
+        remaining -= to_write;
+    }
 #else
-    // --- Phiên bản không ring buffer (enqueue trực tiếp vào pool) ---
     u16_t remaining = p->tot_len;
     u16_t offset = 0;
     u16_t consumed = 0;
 
     while (remaining > 0) {
         audio_buffer_t *buffer = take_audio_buffer(ap, false);
-        if (buffer == NULL) {
-            // Pool cạn → dừng
+        if (!buffer) {
+            printf("[WARN] Audio pool empty, remaining=%u bytes\n", remaining);
+            break;
+        }
+        if (!buffer->buffer) {
+            printf("[ERROR] buffer->buffer is NULL, buffer=%p\n", buffer);
             break;
         }
 
         int cap_bytes = buffer->max_sample_count * producer_format.sample_stride;
         int to_copy   = (remaining > cap_bytes) ? cap_bytes : remaining;
+        if (to_copy > cap_bytes) {
+            printf("[WARN] to_copy (%d) > cap_bytes (%d), clipping\n", to_copy, cap_bytes);
+            to_copy = cap_bytes;
+        }
+
+        printf("[DEBUG] take buffer %p, bytes %p, to_copy=%d, offset=%u, remaining=%u\n",
+               buffer, buffer->buffer, to_copy, offset, remaining);
 
         pbuf_copy_partial(p, buffer->buffer->bytes, to_copy, offset);
         buffer->sample_count = to_copy / producer_format.sample_stride;
@@ -353,7 +428,9 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err
     }
 
     if (remaining > 0) {
-        printf("Backpressure: dropped %u bytes (no audio buffers)\n", remaining);
+        static int total_dropped = 0;
+        total_dropped += remaining;
+        printf("[WARN] Backpressure: dropped %u bytes (total dropped=%d)\n", remaining, total_dropped);
     }
 #endif
 
@@ -361,21 +438,20 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err
     return ERR_OK;
 }
 
+
 #if USE_RING_BUFFER
-// Task chạy nền: lấy từ ring buffer ra audio pool
 void audio_feed_task(void) {
-    while (1) {
-        audio_buffer_t *buffer = take_audio_buffer(ap, true);
-        if (!buffer) continue;
+    audio_buffer_t *buffer = take_audio_buffer(ap, true);
+    if (!buffer) return;
 
-        int cap_bytes = buffer->max_sample_count * producer_format.sample_stride;
-        int got = rb_read(buffer->buffer->bytes, cap_bytes);
-        buffer->sample_count = got / producer_format.sample_stride;
+    int cap_bytes = buffer->max_sample_count * producer_format.sample_stride;
+    int got = rb_read(&audio_ringbuf, buffer->buffer->bytes, cap_bytes);
+    buffer->sample_count = got / producer_format.sample_stride;
 
-        give_audio_buffer(ap, buffer);
-    }
+    give_audio_buffer(ap, buffer);
 }
 #endif
+
 
 
 static void tcp_server_err(void *arg, err_t err) {
@@ -482,13 +558,34 @@ int main() {
     }
 
     printf("Wi-Fi Connected.\n");
-    ap = i2s_audio_init(16000);
+    
+    
+    // 2️⃣ Init I2S audio safely
+    ap = i2s_audio_init_safe(16000);
+    if (!ap) {
+        printf("[MAIN] Failed to init I2S audio\n");
+        cyw43_arch_deinit();
+        return 1;
+    }
 
 #if USE_RING_BUFFER
-    multicore_launch_core1(core1_entry);   // chạy audio_feed_task ở core1
+    // 3️⃣ Init ring buffer only sau khi I2S safe
+    rb_init(&audio_ringbuf);
+    printf("[MAIN] Ring buffer initialized\n");
+
+    // 4️⃣ Launch core1 only if not running
+    if (!multicore_core1_is_running()) {
+        printf("[MAIN] Launching core1\n");
+        multicore_launch_core1(core1_entry);
+    }
 #endif
 
-    run_tcp_server_test();  // core0 lo TCP server
+    // 5️⃣ Start TCP server (core0)
+    printf("[MAIN] Starting TCP server\n");
+    run_tcp_server_test();
+
+    // 6️⃣ Cleanup
     cyw43_arch_deinit();
+    printf("[MAIN] Wi-Fi deinitialized, exiting\n");
     return 0;
 }

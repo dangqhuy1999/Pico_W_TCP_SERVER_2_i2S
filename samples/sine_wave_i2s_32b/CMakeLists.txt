@@ -18,6 +18,7 @@ add_subdirectory(../.. pico_audio_i2s_32b)
 set(bin_name ${PROJECT_NAME})
 add_executable(${PROJECT_NAME}
     main.cpp
+    ringbuf.c
 )
 
 target_include_directories(${bin_name} PRIVATE
