@@ -1,14 +1,15 @@
-[  0%] Built target pico_audio_i2s_32b_audio_i2s_pio_h
-[  1%] Built target bs2_default
-[  1%] Built target cyw43_driver_picow_cyw43_bus_pio_spi_pio_h
-[  2%] Built target bs2_default_library
-Consolidate compiler generated dependencies of target sine_wave_i2s_32b
-[  3%] Building CXX object CMakeFiles/sine_wave_i2s_32b.dir/main.cpp.o
-/home/huydang/Desktop/c_c++/pico_audio_i2s_32b/samples/sine_wave_i2s_32b/main.cpp: In function 'int main()':
-/home/huydang/Desktop/c_c++/pico_audio_i2s_32b/samples/sine_wave_i2s_32b/main.cpp:564:10: error: 'i2s_audio_init_safe' was not declared in this scope; did you mean 'i2s_audio_init_debug'?
-  564 |     ap = i2s_audio_init_safe(16000);
-      |          ^~~~~~~~~~~~~~~~~~~
-      |          i2s_audio_init_debug
-make[2]: *** [CMakeFiles/sine_wave_i2s_32b.dir/build.make:76: CMakeFiles/sine_wave_i2s_32b.dir/main.cpp.o] Error 1
-make[1]: *** [CMakeFiles/Makefile2:2152: CMakeFiles/sine_wave_i2s_32b.dir/all] Error 2
-make: *** [Makefile:91: all] Error 2
+[  0%] Built target bs2_default
+[  0%] Performing build step for 'pioasmBuild'
+[  1%] Built target bs2_default_library
+[100%] Built target pioasm
+[  2%] Performing install step for 'pioasmBuild'
+[100%] Built target pioasm
+Install the project...
+-- Install configuration: "Release"
+[  3%] Completed 'pioasmBuild'
+[  5%] Built target pioasmBuild
+[  6%] Built target cyw43_driver_picow_cyw43_bus_pio_spi_pio_h
+[  6%] Built target pico_audio_i2s_32b_audio_i2s_pio_h
+[  6%] Building CXX object CMakeFiles/sine_wave_i2s_32b.dir/main.cpp.o
+[  7%] Linking CXX executable sine_wave_i2s_32b.elf
+[100%] Built target sine_wave_i2s_32b

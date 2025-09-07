@@ -19,6 +19,8 @@ set(bin_name ${PROJECT_NAME})
 add_executable(${PROJECT_NAME}
     main.cpp
     ringbuf.c
+    project_audio.cpp
+    tcp_server.c
 )
 
 target_include_directories(${bin_name} PRIVATE

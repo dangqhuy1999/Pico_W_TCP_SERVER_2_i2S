@@ -3,9 +3,12 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <project_config.h>
 
+// trên mỗi hàm để cảnh báo rằng các hàm này không an toàn 
+// cho môi trường đa luồng và cần được bảo vệ bằng spin lock.
 // cấu hình dung lượng ring buffer (tuỳ RAM)
-#define RING_BUFFER_SIZE 8192  
+
 
 typedef struct {
     uint8_t buffer[RING_BUFFER_SIZE];

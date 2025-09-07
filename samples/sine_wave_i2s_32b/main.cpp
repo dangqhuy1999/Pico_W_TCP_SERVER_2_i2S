@@ -1,591 +1,85 @@
-/**
- * Copyright (c) 2022 Raspberry Pi (Trading) Ltd.
- *
- * SPDX-License-Identifier: BSD-3-Clause
- */
-#include "pico/multicore.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <math.h>
-#include "hardware/pll.h"
-#include "hardware/clocks.h"
-#include "hardware/structs/clocks.h"
-#include "hardware/pio.h"
+
+#include "pico/multicore.h"
 #include "pico/stdlib.h"
 #include "pico/cyw43_arch.h"
+#include "pico/audio.h"
+#include "pico/audio_i2s.h"
+
 #include "lwipopts.h"
 #include "lwip/pbuf.h"
 #include "lwip/tcp.h"
+
+// Các file tự định nghĩa
 #include "project_config.h"
-#include "pico/audio.h"
-#include "pico/audio_i2s.h"
 #include "ringbuf.h"
+#include "tcp_server.h" // file chứa hàm tcp_server_recv và run_tcp_server_test
+#include "project_audio.h"
 
-#define SINE_WAVE_TABLE_LEN 2048
-#define SAMPLES_PER_BUFFER 1024  // frames / channel
-#define BUFFER_COUNT       12    // số buffer trong pool
-#define USE_RING_BUFFER 0   // 0 = không dùng ring buffer, 1 = dùng ring buffer
-#define audio_pio __CONCAT(pio, PICO_AUDIO_I2S_PIO)
-
-
-static const uint32_t PIN_DCDC_PSM_CTRL = 23;
-
-audio_buffer_pool_t *ap;
-
-static bool decode_flg = false;
-static constexpr int32_t DAC_ZERO = 1;
-
-static audio_format_t audio_format = {
-    .sample_freq = 16000,
-    .pcm_format = AUDIO_PCM_FORMAT_S16,
-    .channel_count = AUDIO_CHANNEL_STEREO
-};
-
-static audio_buffer_format_t producer_format = {
-    .format = &audio_format,
-    .sample_stride = 4
-};
-
-static audio_i2s_config_t i2s_config = {
-    .data_pin = PICO_AUDIO_I2S_DATA_PIN,
-    .clock_pin_base = PICO_AUDIO_I2S_CLOCK_PIN_BASE,
-    .dma_channel0 = PICO_AUDIO_I2S_DMA_CHANNEL,
-    .dma_channel1 = PICO_AUDIO_I2S_DMA_CHANNEL + 1,
-    .pio_sm = 0
-};
-
-static int16_t sine_wave_table[SINE_WAVE_TABLE_LEN];
-uint32_t step0 = 0x200000;
-uint32_t step1 = 0x200000;
-uint32_t pos0 = 0;
-uint32_t pos1 = 0;
-const uint32_t pos_max = 0x10000 * SINE_WAVE_TABLE_LEN;
-uint vol = 20;
-
-
-#if USE_RING_BUFFER
+// Biến toàn cục được chia sẻ giữa các file
 static ringbuf_t audio_ringbuf;
-#endif
+static spin_lock_t *audio_lock; // Khóa để bảo vệ ring buffer
 
-#if 0
-audio_buffer_pool_t *init_audio() {
-
-    static audio_format_t audio_format = {
-        .pcm_format = AUDIO_PCM_FORMAT_S32,
-        .sample_freq = 44100,
-        .channel_count = 2
-    };
-
-    static audio_buffer_format_t producer_format = {
-        .format = &audio_format,
-        .sample_stride = 8
-    };
-
-    audio_buffer_pool_t *producer_pool = audio_new_producer_pool(&producer_format, 3,
-                                                                      SAMPLES_PER_BUFFER); // todo correct size
-    bool __unused ok;
-    const audio_format_t *output_format;
-#if USE_AUDIO_I2S
-    audio_i2s_config_t config = {
-        .data_pin = PICO_AUDIO_I2S_DATA_PIN,
-        .clock_pin_base = PICO_AUDIO_I2S_CLOCK_PIN_BASE,
-        .dma_channel = 0,
-        .pio_sm = 0
-    };
-
-    output_format = audio_i2s_setup(&audio_format, &audio_format, &config);
-    if (!output_format) {
-        panic("PicoAudio: Unable to open audio device.\n");
-    }
-
-    ok = audio_i2s_connect(producer_pool);
-    assert(ok);
-    { // initial buffer data
-        audio_buffer_t *buffer = take_audio_buffer(producer_pool, true);
-        int32_t *samples = (int32_t *) buffer->buffer->bytes;
-        for (uint i = 0; i < buffer->max_sample_count; i++) {
-            samples[i*2+0] = 0;
-            samples[i*2+1] = 0;
-        }
-        buffer->sample_count = buffer->max_sample_count;
-        give_audio_buffer(producer_pool, buffer);
-    }
-    audio_i2s_set_enabled(true);
-#elif USE_AUDIO_PWM
-    output_format = audio_pwm_setup(&audio_format, -1, &default_mono_channel_config);
-    if (!output_format) {
-        panic("PicoAudio: Unable to open audio device.\n");
-    }
-    ok = audio_pwm_default_connect(producer_pool, false);
-    assert(ok);
-    audio_pwm_set_enabled(true);
-#elif USE_AUDIO_SPDIF
-    output_format = audio_spdif_setup(&audio_format, &audio_spdif_default_config);
-    if (!output_format) {
-        panic("PicoAudio: Unable to open audio device.\n");
-    }
-    //ok = audio_spdif_connect(producer_pool);
-    ok = audio_spdif_connect(producer_pool);
-    assert(ok);
-    audio_spdif_set_enabled(true);
-#endif
-    return producer_pool;
-}
-#endif
-
-typedef struct TCP_SERVER_T_ {
-    struct tcp_pcb *server_pcb;
-    struct tcp_pcb *client_pcb;
-    bool complete;
-    uint8_t buffer_sent[BUF_SIZE];
-    uint8_t buffer_recv[BUF_SIZE];
-    int sent_len;
-    int recv_len;
-    int run_count;
-} TCP_SERVER_T;
-
-/*
-audio_buffer_pool_t *i2s_audio_init(uint32_t sample_freq)
-{
-    audio_format.sample_freq = sample_freq;
-
-    audio_buffer_pool_t *producer_pool = audio_new_producer_pool(&producer_format, BUFFER_COUNT, SAMPLES_PER_BUFFER);
-    if (!producer_pool) {
-        printf("Failed to allocate audio producer pool!\n");
-        return NULL;
-    }
-    ap = producer_pool;
-
-    const audio_format_t *output_format = audio_i2s_setup(&audio_format, &audio_format, &i2s_config);
-    if (!output_format) {
-        panic("PicoAudio: Unable to open audio device.\n");
-    }
-
-    bool __unused ok = audio_i2s_connect(producer_pool);
-    assert(ok);
-
-    // initial buffer = silence
-    audio_buffer_t *ab = take_audio_buffer(producer_pool, true);
-    if (!ab) {
-        printf("Failed to take initial audio buffer!\n");
-        return NULL;
-    }
-
-    int16_t *samples = (int16_t *) ab->buffer->bytes;
-    for (uint i = 0; i < ab->max_sample_count; i++) {
-        samples[i*2+0] = DAC_ZERO;
-        samples[i*2+1] = DAC_ZERO;
-    }
-    ab->sample_count = ab->max_sample_count;
-    give_audio_buffer(producer_pool, ab);
-
-    audio_i2s_set_enabled(true);
-    decode_flg = true;
-
-    return producer_pool;
-}
-*/
-
-// ⚠️ Các biến debug-safe, chỉ để quan sát bằng GDB
-volatile uint32_t dbg_sample_freq = 0;
-volatile uintptr_t dbg_producer_pool = 0;
-volatile bool dbg_i2s_enabled = false;
-
-audio_buffer_pool_t *i2s_audio_init_debug(uint32_t sample_freq) {
-
-#if 0  // USE_RING_BUFFER
-    if (multicore_core1_is_running()) {
-        multicore_reset_core1();  // halt core1 để tránh ghi đè RAM
-    }
-#endif
-
-    // 1️⃣ Cập nhật sample rate
-    audio_format.sample_freq = sample_freq;
-    dbg_sample_freq = sample_freq;  // Ghi lại để debug
-
-    // 2️⃣ Tạo producer pool
-    audio_buffer_pool_t *producer_pool = audio_new_producer_pool(
-        &producer_format,
-        BUFFER_COUNT,
-        SAMPLES_PER_BUFFER
-    );
-    if (!producer_pool) {
-        dbg_producer_pool = 0;
-        return NULL;
-    }
-    ap = producer_pool;
-    dbg_producer_pool = (uintptr_t)producer_pool; // GDB có thể xem địa chỉ pool
-
-    // 3️⃣ Setup I2S
-    const audio_format_t *output_format = audio_i2s_setup(&audio_format, &audio_format, &i2s_config);
-    if (!output_format) {
-        dbg_i2s_enabled = false;
-        return NULL;
-    }
-
-    // 4️⃣ Connect pool
-    if (!audio_i2s_connect(producer_pool)) {
-        dbg_i2s_enabled = false;
-        return NULL;
-    }
-
-    // 5️⃣ Init first buffer = silence
-    audio_buffer_t *ab = take_audio_buffer(producer_pool, true);
-    if (!ab || !ab->buffer || !ab->buffer->bytes) {
-        dbg_i2s_enabled = false;
-        return NULL;
-    }
-
-    int16_t *samples = (int16_t *) ab->buffer->bytes;
-    for (uint i = 0; i < ab->max_sample_count; i++) {
-        samples[i*2+0] = DAC_ZERO;
-        samples[i*2+1] = DAC_ZERO;
-    }
-    ab->sample_count = ab->max_sample_count;
-    give_audio_buffer(producer_pool, ab);
-
-    // 6️⃣ Enable I2S & set decode flag
-    audio_i2s_set_enabled(true);
-    decode_flg = true;
-    dbg_i2s_enabled = true;
-
-    return producer_pool;
-}
-
-
-void i2s_audio_deinit()
-{
-    decode_flg = false;
-
-    audio_i2s_set_enabled(false);
-    audio_i2s_end();
-
-    audio_buffer_t* ab;
-    ab = take_audio_buffer(ap, false);
-    while (ab != nullptr) {
-        free(ab->buffer->bytes);
-        free(ab->buffer);
-        ab = take_audio_buffer(ap, false);
-    }
-    ab = get_free_audio_buffer(ap, false);
-    while (ab != nullptr) {
-        free(ab->buffer->bytes);
-        free(ab->buffer);
-        ab = get_free_audio_buffer(ap, false);
-    }
-    ab = get_full_audio_buffer(ap, false);
-    while (ab != nullptr) {
-        free(ab->buffer->bytes);
-        free(ab->buffer);
-        ab = get_full_audio_buffer(ap, false);
-    }
-    free(ap);
-    ap = nullptr;
-}
-
-void decode()
-{
-    audio_buffer_t *buffer = take_audio_buffer(ap, false);
-    if (buffer == NULL) { return; }
-    int32_t *samples = (int32_t *) buffer->buffer->bytes;
-    for (uint i = 0; i < buffer->max_sample_count; i++) {
-        int32_t value0 = (vol * sine_wave_table[pos0 >> 16u]) << 8u;
-        int32_t value1 = (vol * sine_wave_table[pos1 >> 16u]) << 8u;
-        // use 32bit full scale
-        samples[i*2+0] = value0 + (value0 >> 16u);  // L
-        samples[i*2+1] = value1 + (value1 >> 16u);  // R
-        pos0 += step0;
-        pos1 += step1;
-        if (pos0 >= pos_max) pos0 -= pos_max;
-        if (pos1 >= pos_max) pos1 -= pos_max;
-    }
-    buffer->sample_count = buffer->max_sample_count;
-    give_audio_buffer(ap, buffer);
-    return;
-}
-
-extern "C" {
-// callback from:
-//   void __isr __time_critical_func(audio_i2s_dma_irq_handler)()
-//   defined at my_pico_audio_i2s/audio_i2s.c
-//   where i2s_callback_func() is declared with __attribute__((weak))
-void i2s_callback_func()
-{
-    if (decode_flg) {
-        decode();
-    }
-}
-}  
-
-static TCP_SERVER_T* tcp_server_init(void) {
-    TCP_SERVER_T *state = (TCP_SERVER_T *)calloc(1, sizeof(TCP_SERVER_T));
-    if (!state) {
-        DEBUG_printf("failed to allocate state\n");
-        return NULL;
-    }
-    return state;
-}
-
-static err_t tcp_server_close(void *arg) {
-    TCP_SERVER_T *state = (TCP_SERVER_T*)arg;
-    err_t err = ERR_OK;
-    if (state->client_pcb != NULL) {
-        tcp_arg(state->client_pcb, NULL);
-        tcp_recv(state->client_pcb, NULL);
-        tcp_err(state->client_pcb, NULL);
-        err = tcp_close(state->client_pcb);
-        if (err != ERR_OK) {
-            DEBUG_printf("close failed %d, calling abort\n", err);
-            tcp_abort(state->client_pcb);
-            err = ERR_ABRT;
-        }
-        state->client_pcb = NULL;
-    }
-    if (state->server_pcb) {
-        tcp_arg(state->server_pcb, NULL);
-        tcp_close(state->server_pcb);
-        state->server_pcb = NULL;
-    }
-    return err;
-}
-
-err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err) {
-    if (!p) {
-        printf("[INFO] Client closed the connection.\n");
-        return ERR_OK;
-    }
-
-    if (err != ERR_OK) {
-        printf("[WARN] TCP error %d, freeing pbuf\n", err);
-        pbuf_free(p);
-        return err;
-    }
-
-    if (!p->payload) {
-        printf("[ERROR] pbuf payload is NULL, tot_len=%u\n", p->tot_len);
-        pbuf_free(p);
-        return ERR_OK;
-    }
-
-#if USE_RING_BUFFER
-    uint16_t remaining = p->tot_len;
-    uint16_t offset = 0;
-
-    while (remaining > 0) {
-        uint16_t space = rb_space(&audio_ringbuf);
-        uint16_t to_write = (remaining > space) ? space : remaining;
-
-        if (to_write == 0) {
-            printf("[WARN] Ring buffer full, dropping %u bytes\n", remaining);
-            break;
-        }
-
-        rb_write(&audio_ringbuf, (uint8_t *)p->payload + offset, to_write);
-        tcp_recved(tpcb, to_write);
-
-        offset    += to_write;
-        remaining -= to_write;
-    }
-#else
-    u16_t remaining = p->tot_len;
-    u16_t offset = 0;
-    u16_t consumed = 0;
-
-    while (remaining > 0) {
-        audio_buffer_t *buffer = take_audio_buffer(ap, false);
-        if (!buffer) {
-            printf("[WARN] Audio pool empty, remaining=%u bytes\n", remaining);
-            break;
-        }
-        if (!buffer->buffer) {
-            printf("[ERROR] buffer->buffer is NULL, buffer=%p\n", buffer);
-            break;
-        }
-
-        int cap_bytes = buffer->max_sample_count * producer_format.sample_stride;
-        int to_copy   = (remaining > cap_bytes) ? cap_bytes : remaining;
-        if (to_copy > cap_bytes) {
-            printf("[WARN] to_copy (%d) > cap_bytes (%d), clipping\n", to_copy, cap_bytes);
-            to_copy = cap_bytes;
-        }
-
-        printf("[DEBUG] take buffer %p, bytes %p, to_copy=%d, offset=%u, remaining=%u\n",
-               buffer, buffer->buffer, to_copy, offset, remaining);
-
-        pbuf_copy_partial(p, buffer->buffer->bytes, to_copy, offset);
-        buffer->sample_count = to_copy / producer_format.sample_stride;
-
-        give_audio_buffer(ap, buffer);
-
-        offset    += to_copy;
-        remaining -= to_copy;
-        consumed  += to_copy;
-    }
-
-    if (consumed > 0) {
-        tcp_recved(tpcb, consumed);
-    }
-
-    if (remaining > 0) {
-        static int total_dropped = 0;
-        total_dropped += remaining;
-        printf("[WARN] Backpressure: dropped %u bytes (total dropped=%d)\n", remaining, total_dropped);
-    }
-#endif
-
-    pbuf_free(p);
-    return ERR_OK;
-}
-
-
-#if USE_RING_BUFFER
-void audio_feed_task(void) {
-    audio_buffer_t *buffer = take_audio_buffer(ap, true);
-    if (!buffer) return;
-
-    int cap_bytes = buffer->max_sample_count * producer_format.sample_stride;
-    int got = rb_read(&audio_ringbuf, buffer->buffer->bytes, cap_bytes);
-    buffer->sample_count = got / producer_format.sample_stride;
-
-    give_audio_buffer(ap, buffer);
-}
-#endif
-
-
-
-static void tcp_server_err(void *arg, err_t err) {
-    if (err != ERR_ABRT) {
-        DEBUG_printf("tcp_client_err_fn %d\n", err);
-    }
-}
-
-static err_t tcp_server_accept(void *arg, struct tcp_pcb *client_pcb, err_t err) {
-    TCP_SERVER_T *state = (TCP_SERVER_T*)arg;
-    if (err != ERR_OK || client_pcb == NULL) {
-        DEBUG_printf("Failure in accept\n");
-        return ERR_VAL;
-    }
-    DEBUG_printf("Client connected\n");
-
-    state->client_pcb = client_pcb;
-    tcp_arg(client_pcb, state);
-    tcp_recv(client_pcb, tcp_server_recv);
-    tcp_err(client_pcb, tcp_server_err);
-
-    return ERR_OK;
-}
-
-static bool tcp_server_open(void *arg) {
-    TCP_SERVER_T *state = (TCP_SERVER_T*)arg;
-    DEBUG_printf("Starting server at %s on port %u\n", ip4addr_ntoa(netif_ip4_addr(netif_list)), TCP_PORT);
-
-    struct tcp_pcb *pcb = tcp_new_ip_type(IPADDR_TYPE_ANY);
-    if (!pcb) {
-        DEBUG_printf("failed to create pcb\n");
-        return false;
-    }
-
-    err_t err = tcp_bind(pcb, NULL, TCP_PORT);
-    if (err) {
-        DEBUG_printf("failed to bind to port %u\n", TCP_PORT);
-        return false;
-    }
-
-    state->server_pcb = tcp_listen_with_backlog(pcb, 1);
-    if (!state->server_pcb) {
-        DEBUG_printf("failed to listen\n");
-        if (pcb) {
-            tcp_close(pcb);
-        }
-        return false;
-    }
-
-    tcp_arg(state->server_pcb, state);
-    tcp_accept(state->server_pcb, tcp_server_accept);
-
-    return true;
-}
-
-void run_tcp_server_test(void) {
-    TCP_SERVER_T *state = tcp_server_init();
-    if (!state) {
-        return;
-    }
-    if (!tcp_server_open(state)) {
-        return;
-    }
-    while(true) {
-        // the following #ifdef is only here so this same example can be used in multiple modes;
-        // you do not need it in your code
-#if PICO_CYW43_ARCH_POLL
-        // if you are using pico_cyw43_arch_poll, then you must poll periodically from your
-        // main loop (not from a timer) to check for Wi-Fi driver or lwIP work that needs to be done.
-        cyw43_arch_poll();
-        // you can poll as often as you like, however if you have nothing else to do you can
-        // choose to sleep until either a specified time, or cyw43_arch_poll() has work to do:
-        cyw43_arch_wait_for_work_until(make_timeout_time_ms(1000));
-#else
-        // if you are not using pico_cyw43_arch_poll, then WiFI driver and lwIP work
-        // is done via interrupt in the background. This sleep is just an example of some (blocking)
-        // work you might be doing.
-        sleep_ms(1000);
-#endif
-    }
-    free(state);
-}
-
-#if USE_RING_BUFFER
 void core1_entry() {
     while (true) {
-        audio_feed_task();   // vòng lặp blocking đọc ring buffer → audio
+        project_audio_feed_task(&audio_ringbuf, audio_lock);
     }
 }
-#endif
 
 int main() {
     stdio_init_all();
 
+    // 1️⃣ Khởi tạo Wi-Fi và kết nối
     if (cyw43_arch_init()) {
-        printf("failed to initialise\n");
+        printf("failed to initialise cyw43_arch\n");
         return 1;
     }
-
+    
     cyw43_arch_enable_sta_mode();
-    if (cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASSWORD, CYW43_AUTH_WPA2_AES_PSK, 30000)) {
-        printf("failed to connect.\n");
+
+    // Khai báo biến cục bộ để đảm bảo giá trị được lưu trữ đúng cách
+    const char *ssid = WIFI_SSID;
+    const char *password = WIFI_PASSWORD;
+
+    printf("Connecting to Wi-Fi with SSID: %s\n", ssid);
+    printf("TCP_PORT: %d\n", TCP_PORT);
+
+    if (cyw43_arch_wifi_connect_timeout_ms(ssid, password, CYW43_AUTH_WPA2_AES_PSK, 30000)) {
+        printf("failed to connect to Wi-Fi.\n");
+        return 1;
+    }
+    printf("Wi-Fi Connected.\n");
+
+    // 2️⃣ Khởi tạo ring buffer và spin lock
+    rb_init(&audio_ringbuf);
+    audio_lock = spin_lock_init(spin_lock_claim_unused(true));
+    if (!audio_lock) {
+        printf("[MAIN] Failed to initialize spin lock.\n");
         return 1;
     }
 
-    printf("Wi-Fi Connected.\n");
-    
-    
-    // 2️⃣ Init I2S audio safely
-    ap = i2s_audio_init_safe(16000);
+    // 3️⃣ Khởi tạo hệ thống audio I2S
+    audio_buffer_pool_t *ap = project_audio_init(16000); 
     if (!ap) {
         printf("[MAIN] Failed to init I2S audio\n");
-        cyw43_arch_deinit();
         return 1;
     }
 
-#if USE_RING_BUFFER
-    // 3️⃣ Init ring buffer only sau khi I2S safe
-    rb_init(&audio_ringbuf);
-    printf("[MAIN] Ring buffer initialized\n");
+    // 4️⃣ Khởi chạy Core 1 để xử lý âm thanh
+    multicore_launch_core1(core1_entry);
+    
+    // 5️⃣ Khởi động TCP server trên Core 0
+    run_tcp_server_test(&audio_ringbuf, audio_lock);
 
-    // 4️⃣ Launch core1 only if not running
-    if (!multicore_core1_is_running()) {
-        printf("[MAIN] Launching core1\n");
-        multicore_launch_core1(core1_entry);
+    // Vòng lặp chính để duy trì kết nối và xử lý sự kiện
+    while (true) {
+        cyw43_arch_poll();
+        sleep_ms(10);
     }
-#endif
 
-    // 5️⃣ Start TCP server (core0)
-    printf("[MAIN] Starting TCP server\n");
-    run_tcp_server_test();
-
-    // 6️⃣ Cleanup
+    // Dọn dẹp
     cyw43_arch_deinit();
-    printf("[MAIN] Wi-Fi deinitialized, exiting\n");
     return 0;
 }
