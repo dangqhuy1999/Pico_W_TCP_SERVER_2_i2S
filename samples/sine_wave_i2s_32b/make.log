@@ -1,15 +1,8 @@
-[  0%] Built target bs2_default
-[  0%] Performing build step for 'pioasmBuild'
-[  1%] Built target bs2_default_library
-[100%] Built target pioasm
-[  2%] Performing install step for 'pioasmBuild'
-[100%] Built target pioasm
-Install the project...
--- Install configuration: "Release"
-[  3%] Completed 'pioasmBuild'
-[  5%] Built target pioasmBuild
-[  6%] Built target cyw43_driver_picow_cyw43_bus_pio_spi_pio_h
-[  6%] Built target pico_audio_i2s_32b_audio_i2s_pio_h
-[  6%] Building CXX object CMakeFiles/sine_wave_i2s_32b.dir/main.cpp.o
-[  7%] Linking CXX executable sine_wave_i2s_32b.elf
+[  1%] Built target cyw43_driver_picow_cyw43_bus_pio_spi_pio_h
+[  1%] Built target bs2_default
+[  1%] Built target pico_audio_i2s_32b_audio_i2s_pio_h
+[  2%] Built target bs2_default_library
+Consolidate compiler generated dependencies of target sine_wave_i2s_32b
+[  2%] Building C object CMakeFiles/sine_wave_i2s_32b.dir/tcp_server.c.o
+[  3%] Linking CXX executable sine_wave_i2s_32b.elf
 [100%] Built target sine_wave_i2s_32b

@@ -21,13 +21,14 @@
 // Biến toàn cục được chia sẻ giữa các file
 static ringbuf_t audio_ringbuf;
 static spin_lock_t *audio_lock; // Khóa để bảo vệ ring buffer
+static TCP_SERVER_T* tcp_state;
+
 
 void core1_entry() {
     while (true) {
-        project_audio_feed_task(&audio_ringbuf, audio_lock);
+        project_audio_feed_task(&audio_ringbuf, audio_lock, tcp_state);
     }
 }
-
 int main() {
     stdio_init_all();
 
@@ -39,7 +40,6 @@ int main() {
     
     cyw43_arch_enable_sta_mode();
 
-    // Khai báo biến cục bộ để đảm bảo giá trị được lưu trữ đúng cách
     const char *ssid = WIFI_SSID;
     const char *password = WIFI_PASSWORD;
 
@@ -67,12 +67,20 @@ int main() {
         return 1;
     }
 
+    
+    
+    // 5️⃣ Khởi động TCP server trên Core 0
+    tcp_state = run_tcp_server_test(&audio_ringbuf, audio_lock);
+    
+    // ✅ THÊM LOGIC KIỂM TRA TẠI ĐÂY
+    if (!tcp_state) {
+        printf("[MAIN] Failed to initialize TCP server. Exiting.\n");
+        return 1;
+    }
+
     // 4️⃣ Khởi chạy Core 1 để xử lý âm thanh
     multicore_launch_core1(core1_entry);
     
-    // 5️⃣ Khởi động TCP server trên Core 0
-    run_tcp_server_test(&audio_ringbuf, audio_lock);
-
     // Vòng lặp chính để duy trì kết nối và xử lý sự kiện
     while (true) {
         cyw43_arch_poll();

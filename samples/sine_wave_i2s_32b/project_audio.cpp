@@ -66,41 +66,52 @@ audio_buffer_pool_t *project_audio_init(uint32_t sample_freq) {
     return producer_pool;
 }
 
-void project_audio_feed_task(ringbuf_t *rb, spin_lock_t *lock) {
+void project_audio_feed_task(ringbuf_t *rb, spin_lock_t *lock, TCP_SERVER_T *tcp_state) {
     if (!ap) {
         return;
     }
     
-    // Lấy một buffer rỗng từ pool và chờ nếu cần
     audio_buffer_t *buffer = take_audio_buffer(ap, true);
     if (buffer == nullptr) {
         return;
     }
-    // Thay đổi con trỏ mẫu thành 32-bit
+    
     int32_t *samples = (int32_t *)buffer->buffer->bytes;
     size_t samples_per_buffer = buffer->max_sample_count;
-    // Thay đổi tính toán bytes_to_read cho 32-bit
-    size_t bytes_to_read = samples_per_buffer * sizeof(int32_t) * 2; // 2 kênh, mỗi mẫu 4 byte (S32)
-
-    // Dùng spin lock để đảm bảo an toàn khi truy cập ring buffer
+    size_t bytes_to_read = samples_per_buffer * sizeof(int32_t) * 2;
+    
     uint32_t flags = spin_lock_blocking(lock);
 
     size_t bytes_available = rb_available(rb);
+    
+    // Thêm printf để kiểm tra dữ liệu trước khi xử lý
+    printf("[CORE1] Available: %d bytes, Bytes to read: %d\n", bytes_available, bytes_to_read);
 
-    // Kiểm tra xem có đủ dữ liệu để điền đầy buffer không
     if (bytes_available >= bytes_to_read) {
         rb_read(rb, (uint8_t *)samples, bytes_to_read);
+        printf("[CORE1] READ OK. Processed %d bytes.\n", bytes_to_read);
     } else {
-        // Nếu không đủ, đọc hết dữ liệu có sẵn và điền 0 vào phần còn lại
         size_t bytes_read = rb_read(rb, (uint8_t *)samples, bytes_available);
         size_t samples_read = bytes_read / sizeof(int32_t);
         for (size_t i = samples_read; i < samples_per_buffer * 2; ++i) {
             samples[i] = DAC_ZERO;
         }
+        // Thêm printf ở nhánh else để biết khi nào nó được gọi
+        printf("[CORE1] PARTIAL READ. Processed %d bytes, padded with zeros.\n", bytes_read);
     }
-
+    
     spin_unlock(lock, flags);
-
+    
+    // Đây là điểm quan trọng nhất.
+    // Lỗi có thể nằm ở đây, hãy thêm printf để kiểm tra điều kiện.
+    if (tcp_state && tcp_state->client_pcb && rb_space(rb) > bytes_to_read) {
+        printf("[CORE1] RESUMING TCP. Space available: %d bytes.\n", rb_space(rb));
+        tcp_server_resume(tcp_state->client_pcb);
+    } else {
+        // Thêm printf để biết khi nào điều kiện không được thỏa mãn
+        printf("[CORE1] NOT RESUMING. Space available: %d bytes.\n", rb_space(rb));
+    }
+    
     buffer->sample_count = samples_per_buffer;
     give_audio_buffer(ap, buffer);
 }

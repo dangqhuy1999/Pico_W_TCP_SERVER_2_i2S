@@ -4,14 +4,13 @@
 #include <string.h>
 #include <stdlib.h>
 
-// Định nghĩa cấu trúc, chỉ cần trong file .c
-typedef struct TCP_SERVER_T_ {
-    struct tcp_pcb *server_pcb;
-    struct tcp_pcb *client_pcb;
-    ringbuf_t *ringbuf;
-    spin_lock_t *lock;
-} TCP_SERVER_T;
 
+// Thêm hàm này vào tcp_server.c
+void tcp_server_resume(struct tcp_pcb *pcb) {
+    if (pcb) {
+        tcp_recv(pcb, tcp_server_recv);
+    }
+}
 
 static TCP_SERVER_T* tcp_server_init(ringbuf_t *ringbuf, spin_lock_t *lock) {
     TCP_SERVER_T *state = calloc(1, sizeof(TCP_SERVER_T));
@@ -48,6 +47,10 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err
 
     if (!p) {
         printf("Client closed the connection. Transmission complete.\n");
+        // Báo cho lwIP rằng server đã sẵn sàng nhận thêm dữ liệu
+        // Khi p == NULL, bạn không cần gọi tcp_recved.
+        // Chỉ cần return ERR_OK.
+        // tcp_recved(tpcb, p->tot_len);
         return ERR_OK;
     }
 
@@ -60,18 +63,23 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err
     // Lấy con trỏ đến ring buffer và lock từ cấu trúc state
     ringbuf_t *rb = state->ringbuf;
     spin_lock_t *lock = state->lock;
-    
+
     // Khóa spin lock để đảm bảo an toàn luồng
     uint32_t flags = spin_lock_blocking(lock);
 
-    // Kiểm tra xem ring buffer có đủ chỗ cho toàn bộ gói tin không
-    uint16_t to_write = rb_space(rb);
-    
-    if (to_write < p->tot_len) {
-        // Nếu không đủ, in cảnh báo và không làm gì cả
-        printf("Ring buffer full! Pausing reception.\n");
+    // Kiểm tra xem ring buffer có đủ chỗ không
+    uint16_t space_available = rb_space(rb);
+    printf("[CORE0] Received %d bytes. Ring buffer space: %d\n", p->tot_len, space_available);
+
+    if (space_available < p->tot_len) {
+        printf("Ring buffer full! Waiting for space...\n");
         spin_unlock(lock, flags);
-        return ERR_OK; // Trả về ERR_OK nhưng không giải phóng pbuf
+        
+        // Trả về ERR_WOULDBLOCK để thông báo cho lwIP rằng
+        // gói tin không thể xử lý ngay lập tức.
+        // Gói tin sẽ không bị giải phóng và lwIP sẽ cố gắng gửi lại
+        // hoặc đợi đến lần gọi tcp_recv tiếp theo.
+        return ERR_WOULDBLOCK;
     }
 
     // Nếu đủ, ghi toàn bộ dữ liệu từ pbuf vào ring buffer
@@ -79,18 +87,30 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err
 
     // Mở khóa
     spin_unlock(lock, flags);
-    
+
     // Báo cho lwIP biết dữ liệu đã được xử lý thành công
     tcp_recved(tpcb, p->tot_len);
     pbuf_free(p);
-    
+
     return ERR_OK;
 }
 
 static void tcp_server_err(void *arg, err_t err) {
+    TCP_SERVER_T *state = (TCP_SERVER_T*)arg;
+    
+    // In ra mã lỗi nếu không phải là lỗi kết nối bị hủy bỏ (ERR_ABRT)
     if (err != ERR_ABRT) {
-        printf("tcp_client_err_fn %d\n", err);
+        printf("tcp_server_err: %d - %s\n", err, lwip_strerr(err));
     }
+    
+    // Giải phóng tài nguyên và đặt lại trạng thái khi có lỗi
+    // Quan trọng: Phải gọi hàm này để dọn dẹp kết nối TCP
+    tcp_server_close(state);
+    
+    // Đặt lại con trỏ client_pcb thành NULL để báo hiệu không có kết nối
+    state->client_pcb = NULL;
+
+    printf("TCP connection closed due to error or remote host disconnect.\n");
 }
 
 static err_t tcp_server_accept(void *arg, struct tcp_pcb *client_pcb, err_t err) {
@@ -135,17 +155,27 @@ static bool tcp_server_open(void *arg) {
 
     tcp_arg(state->server_pcb, state);
     tcp_accept(state->server_pcb, tcp_server_accept);
-    printf("Listening on port %d\n", TCP_PORT);
+
+    // Dòng này sẽ hiển thị IP và cổng sau khi server đã sẵn sàng lắng nghe
+    printf("Listening on %s port %d\n", ip4addr_ntoa(netif_ip4_addr(netif_list)), TCP_PORT);
     return true;
 }
 
-void run_tcp_server_test(ringbuf_t *ringbuf, spin_lock_t *lock) {
+TCP_SERVER_T* run_tcp_server_test(ringbuf_t *ringbuf, spin_lock_t *lock) {
     TCP_SERVER_T *state = tcp_server_init(ringbuf, lock);
+    
     if (!state) {
-        return;
+        printf("[TCP] Failed to initialize TCP server state.\n");
+        return NULL; // Trả về NULL khi không thể khởi tạo
     }
+    
     if (!tcp_server_open(state)) {
-        tcp_server_close(state);
-        return;
+        printf("[TCP] Failed to open TCP server. Closing state.\n");
+        // Hàm tcp_server_close sẽ dọn dẹp state
+        tcp_server_close(state); 
+        return NULL; // Trả về NULL khi không thể mở server
     }
+    
+    printf("[TCP] TCP server is listening on port %d...\n", TCP_PORT);
+    return state; // Trả về con trỏ trạng thái khi thành công
 }

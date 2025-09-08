@@ -1,4 +1,5 @@
 #include "ringbuf.h"
+#include "project_config.h"
 
 void rb_init(ringbuf_t *rb) {
     rb->head = rb->tail = 0;
