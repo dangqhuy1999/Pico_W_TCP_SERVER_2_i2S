@@ -36,6 +36,8 @@ target_link_libraries(${bin_name} PRIVATE
     pico_stdlib
     pico_audio_32b
     pico_audio_i2s_32b
+    lwip
+    lwip_mdns
 )
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE
